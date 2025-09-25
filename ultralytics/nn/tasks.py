@@ -17,59 +17,39 @@ from ultralytics.nn.modules import (
     C3TR,
     ELAN1,
     OBB,
-    PSA,
-    CBAM,
+    MSCBAM,
     SEAttention,
-    CoordAtt,
     ECAAttention,
     SPP,
     SPPELAN,
     SPPF,
-    AConv,
-    ADown,
     Bottleneck,
     BottleneckCSP,
     C2f,
-    C2fPara,
-    C2fAttn,
-    C2fCBam,
-    C2fCIB,
-    C2fMSC,
+    C2fDMSC,
     C3Ghost,
-    C3x,
     CBFuse,
     CBLinear,
     Classify,
     Concat,
-    BiFPN_Concat3,
-    BiFPN_Concat2,
-    BiFPN_WConcat3,
-    BiFPN_WConcat2,
     Conv,
     Conv2,
-    Faster_Block,
     ConvTranspose,
     Detect,
-    Fusion,
     DWConv,
-    DDWConv,
     DWConvTranspose2d,
     Focus,
     GhostBottleneck,
     GhostConv,
-    LDConv,
     HGBlock,
     HGStem,
     ImagePoolingAttn,
     Pose,
-    RepC3,
-    RepConv,
     RepNCSPELAN4,
     RepVGGDW,
-    RepCross,
+    DMSC,
     ResNetLayer,
     RTDETRDecoder,
-    SCDown,
     Segment,
     WorldDetect,
     v10Detect,
@@ -215,7 +195,7 @@ class BaseModel(nn.Module):
         """
         if not self.is_fused():
             for m in self.model.modules():
-                if isinstance(m, (Conv, Conv2, DWConv, DDWConv, Faster_Block)) and hasattr(m, "bn"):
+                if isinstance(m, (Conv, Conv2, DWConv )) and hasattr(m, "bn"):
                     if isinstance(m, Conv2):
                         m.fuse_convs()
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
@@ -225,7 +205,7 @@ class BaseModel(nn.Module):
                     m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
-                if isinstance(m, RepConv):
+                if isinstance(m):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepVGGDW):
@@ -666,7 +646,7 @@ class WorldModel(DetectionModel):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-            if isinstance(m, C2fAttn):
+            if isinstance(m):
                 x = m(x, txt_feats)
             elif isinstance(m, WorldDetect):
                 x = m(x, ori_txt_feats)
@@ -982,54 +962,36 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             Conv,
             ConvTranspose,
             GhostConv,
-            LDConv,
             Bottleneck,
             GhostBottleneck,
             SPP,
             SPPF,
             DWConv,
-            DDWConv,
-            Faster_Block,
             Focus,
             BottleneckCSP,
             C1,
             C2,
             C2f,
-            C2fPara,
-            C2fCBam,
             RepNCSPELAN4,
             ELAN1,
-            ADown,
-            AConv,
             SPPELAN,
-            C2fAttn,
             C3,
             C3TR,
             C3Ghost,
             nn.ConvTranspose2d,
             DWConvTranspose2d,
-            C3x,
-            RepC3,
-            PSA,
-            CBAM,
+            MSCBAM,
             SEAttention,
-            CoordAtt,
             ECAAttention,
-            SCDown,
-            C2fCIB,
-            C2fMSC,
+            C2fDMSC,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)  # embed channels
-                args[2] = int(
-                    max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2]
-                )  # num heads
+
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C1, C2, C2f, C2fPara,C2fCBam, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3, C2fCIB, C2fMSC}:
+            if m in {BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C2fDMSC}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is AIFI:
@@ -1046,24 +1008,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m is BiFPN_Concat3:
-            c2 = sum(ch[x] for x in f)
-        elif m is BiFPN_Concat2:
-            c2 = sum(ch[x] for x in f)
-        elif m is BiFPN_WConcat3:
-            c2 = sum(ch[x] for x in f)
-        elif m is BiFPN_WConcat2:
-            c2 = sum(ch[x] for x in f)
         elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
-        elif m is Fusion:
-            args[0] = 'bifpn'
-            c1, c2 = [ch[x] for x in f], (sum([ch[x] for x in f]) if args[0] == 'concat' else ch[f[0]])
-            args = [c1, args[0]]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
