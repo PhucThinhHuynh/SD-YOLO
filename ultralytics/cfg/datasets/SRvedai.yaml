@@ -1,0 +1,31 @@
+# COCO 2017 dataset http://cocodataset.org - first 128 training images
+# Train command: python train.py --data coco128.yaml
+# Default dataset location is next to /yolov3:
+#   /parent_folder
+#     /coco128
+#     /yolov3
+
+
+# download command/URL (optional)
+#download: https://github.com/ultralytics/yolov5/releases/download/v1.0/coco128.zip
+
+# train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
+# train: ../coco128/images/train2017/  # 128 images
+# val: ../coco128/images/train2017/  # 128 images
+train: /kaggle/input/my-vedai-yolo/Vedai_final/train
+test: /kaggle/input/my-vedai-yolo/Vedai_final/test
+val: /kaggle/input/my-vedai-yolo/Vedai_final/val
+
+# number of classes
+#nc: 8
+names:
+  0: car
+  1: pickup
+  2: camping
+  3: truck
+  4: other
+  5: tractor
+  6: boat
+  7: van
+
+

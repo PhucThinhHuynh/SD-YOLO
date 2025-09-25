@@ -7,8 +7,8 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
-from .transformer import TransformerBlock
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad, Faster_Block, BiFPN_WConcat, LDConv, CBAM
+from .transformer import TransformerBlock, DeformableTransformerDecoderLayer
 
 __all__ = (
     "DFL",
@@ -20,7 +20,10 @@ __all__ = (
     "C2",
     "C3",
     "C2f",
+    "C2fPara",
+    "Fusion",
     "C2fAttn",
+    "C2fCBam",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
@@ -41,8 +44,10 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "RepVGGDW",
+    "RepCross",
     "CIB",
     "C2fCIB",
+    "C2fMSC",
     "Attention",
     "PSA",
     "SCDown",
@@ -145,7 +150,42 @@ class HGBlock(nn.Module):
         y = self.ec(self.sc(torch.cat(y, 1)))
         return y + x if self.add else y
 
+class HGFBlock(nn.Module):
+    def __init__(self, c1, cm, c2, k=3, n=6, lightconv=False, shortcut=False, act=nn.ReLU(), fusion_type='concat'):
+        super().__init__()
+        block = LightConv if lightconv else Conv
 
+        # Tạo ModuleList cho n lớp
+        self.m = nn.ModuleList([
+            block(c1 if i == 0 else cm, cm, k=k, act=act) for i in range(n)
+        ])
+
+        # Khởi tạo lớp Fusion
+        self.fusion = Fusion([c1] + [cm] * n, fusion=fusion_type)
+
+        # Squeeze và Excitation convolution
+        self.sc = Conv(c1 + n * cm, c2 // 2, 1, 1, act=act)
+        self.ec = Conv(c2 // 2, c2, 1, 1, act=act)
+
+        # Xác định có dùng shortcut connection không
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        outputs = [x]  # Lưu đầu vào ban đầu
+
+        # Duyệt qua từng lớp trong ModuleList
+        for m in self.m:
+            y = m(outputs[-1])  # Tính đầu ra của lớp hiện tại
+            outputs.append(y)  # Lưu đầu ra để hợp nhất sau
+
+        # Dùng lớp Fusion để hợp nhất tất cả các đầu ra
+        y = self.fusion(outputs)
+
+        # Qua squeeze và excitation convolution
+        y = self.ec(self.sc(y))
+
+        # Trả về y + x nếu có shortcut, ngược lại chỉ trả về y
+        return y + x if self.add else y
 class SPP(nn.Module):
     """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
 
@@ -232,6 +272,7 @@ class C2f(nn.Module):
     def forward(self, x):
         """Forward pass through C2f layer."""
         y = list(self.cv1(x).chunk(2, 1))
+        # y = list(channel_shuffle(self.cv1(x),4).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
@@ -240,6 +281,372 @@ class C2f(nn.Module):
         y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class C2fPara(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """
+        Initializes a CSP bottleneck with 2 convolutions and n Bottleneck blocks for faster processing.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # Hidden channels
+
+        # Convolution đầu tiên: Giảm chiều đầu vào
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+
+        # Convolution cuối cùng để hợp nhất tất cả các đặc trưng
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+
+        # ModuleList chứa n lớp Bottleneck
+        self.m = nn.ModuleList([
+            Bottleneck(self.c * (i + 1), self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
+            for i in range(n)
+        ])
+        # self.m = nn.ModuleList([
+        #     CrossConvPro(self.c * (i + 1), self.c, 3, 1, g, 1, shortcut) for i in range(n)
+        # ])
+
+    def forward(self, x):
+        """Forward pass through C2f layer with dense connections."""
+
+        # Tách đầu vào ban đầu thành 2 phần
+        y = list(self.cv1(x).chunk(2, 1))  # [y_0, y_1]
+
+        # Duyệt qua từng Bottleneck, mỗi đầu vào là concat các đầu ra trước đó
+        for i, m in enumerate(self.m):
+            # Nối tất cả các đầu ra trước đó để làm đầu vào cho Bottleneck hiện tại
+            bottleneck_input = torch.cat(y[1:], dim=1)
+            bottleneck_input = channel_shuffle(bottleneck_input, 4)
+
+            # Đầu ra của Bottleneck hiện tại
+            out = m(bottleneck_input)
+
+            # Thêm đầu ra mới vào danh sách các đầu ra
+            y.append(out)
+
+        # Sau khi có tất cả đầu ra, nối lại để qua convolution cuối cùng
+        y_concat = torch.cat(y, dim=1)
+
+        # Qua convolution cuối để hợp nhất đặc trưng
+        return self.cv2(y_concat)
+
+# class CrossConvPro(nn.Module):
+#     # Cross Convolution Downsample
+#     def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+#         super().__init__()
+#         c_ = int(c2 * e)  # hidden channels
+#
+#         # Khởi tạo các Convolutions
+#         self.cv1 = Conv(c1, c_, (1, k), (1, s))
+#         self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
+#         self.cv5 = Conv(c1, c_, (1, 7), (1, s))
+#         self.cv6 = Conv(c_, c2, (7, 1), (s, 1), g=g)
+#
+#         # Khởi tạo lớp Fusion
+#         self.fusion3 = Fusion([c2, c2, c2], fusion='bifpn')  # Lựa chọn kiểu fusion 'bifpn'
+#         self.fusion2 = Fusion([ c2, c2], fusion='bifpn')  # Lựa chọn kiểu fusion 'bifpn'
+#         self.add = shortcut and c1 == c2
+#
+#     def forward(self, x):
+#         """Performs feature sampling, expanding, and applies shortcut if channels match."""
+#         attn_0 = self.cv1(x)
+#         attn_0 = self.cv2(attn_0)
+#
+#         attn_2 = self.cv5(x)
+#         attn_2 = self.cv6(attn_2)
+#
+#
+#         # Áp dụng shortcut nếu cần
+#         return self.fusion3([x, attn_0, attn_2]) if self.add else self.fusion2([attn_0, attn_2])
+
+
+# class RepCross(torch.nn.Module):
+#     def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False) -> None:
+#         super().__init__()
+#         c_ = int(c2 * e)  # hidden channels
+#         self.cv5 = Conv(c1, c_, (1, k), (1, s), p=(0, k // 2))
+#         self.cv6 = Conv(c_, c2, (k, 1), (s, 1), g=g, p=(k // 2, 0))
+#         # self.conv = self.cv2(self.cv1)
+#         # self.cv3 = Conv(c1, c_, (1, 5), (1, s),padding=(0, 5//2))
+#         # self.cv4 = Conv(c_, c2, (5, 1), (s, 1), g=g,padding=(5//2,0))
+#         self.cv1 = Conv(c1, c_, (1, 7), (1, s), p=(0, 7 // 2))
+#         self.cv2 = Conv(c_, c2, (7, 1), (s, 1), g=g, p=(7 // 2, 0))
+#         # self.conv1 = self.cv5(self.cv6)
+#         self.add = shortcut and c1 == c2
+#         # self.act = nn.SiLU()
+#
+#     def forward(self, x):
+#         attn_0 = self.cv1(x)
+#         attn_2 = self.cv5(x)
+#         x = attn_0 + attn_2
+#         attn_0 = self.cv2(x)
+#         attn_2 = self.cv6(x)
+#         # attn_1 = self.cv3(x)
+#         # attn_1 = self.cv4(attn_1)
+#         attn = attn_0 + attn_2
+#         # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+#         return x + attn if self.add else attn
+#
+#     def forward_fuse(self, x):
+#         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+#
+#     @torch.no_grad()
+#     def fuse(self):
+#         cv1 = fuse_conv_and_bn(self.cv1.conv, self.cv1.bn)
+#         cv5 = fuse_conv_and_bn(self.cv5.conv, self.cv5.bn)
+#
+#         cv2 = fuse_conv_and_bn(self.cv2.conv, self.cv2.bn)
+#         cv6 = fuse_conv_and_bn(self.cv6.conv, self.cv6.bn)
+#
+#         cv1_w = cv1.weight
+#         cv1_b = cv1.bias
+#         cv5_w = cv5.weight
+#         cv5_b = cv5.bias
+#
+#         cv2_w = cv2.weight
+#         cv2_b = cv2.bias
+#         cv6_w = cv6.weight
+#         cv6_b = cv6.bias
+#
+#         # cv5_w = torch.nn.functional.avg_pool2d(cv5_w, (1,3), 2)
+#         # cv6_w = torch.nn.functional.avg_pool2d(cv6_w, (3,1), 2)
+#
+#         print(cv5_w.shape)
+#         print(cv6_w.shape)
+#         cv5_w = torch.nn.functional.pad(cv5_w, [2, 2, 0, 0])
+#         cv6_w = torch.nn.functional.pad(cv6_w, [0, 0, 2, 2])
+#
+#
+#
+#         final_conv_w = cv1_w + cv5_w
+#         final_conv_b = cv1_b + cv5_b
+#         final1_conv_w = cv2_w + cv6_w
+#         final1_conv_b = cv2_b + cv6_b
+#
+#         print(cv1_w.shape)
+#         print(final_conv_w.shape)
+#         print(cv5_w.shape)
+#
+#         print(cv2_w.shape)
+#         print(final1_conv_w.shape)
+#         print(cv6_w.shape)
+#
+#         cv1.weight.data.copy_(final_conv_w)
+#         cv1.bias.data.copy_(final_conv_b)
+#         cv2.weight.data.copy_(final1_conv_w)
+#         cv2.bias.data.copy_(final1_conv_b)
+#
+#         self.cv1 = cv1
+#         self.cv2 = cv2
+#         del self.cv5
+#         del self.cv6
+class CrossConvDilated(nn.Module):
+    # Cross Convolution Downsample
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+        """
+        Initializes CrossConv with downsampling, expanding, and optionally shortcutting; `c1` input, `c2` output
+        channels.
+
+        Inputs are ch_in, ch_out, kernel, stride, groups, expansion, shortcut.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        # self.cv1 = Conv(c1, c_, (1, k), (1, s),padding=(0, k//2))
+        # self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g,padding=(k//2,0))
+        # # self.cv3 = Conv(c1, c_, (1, 5), (1, s),padding=(0, 5//2))
+        # # self.cv4 = Conv(c_, c2, (5, 1), (s, 1), g=g,padding=(5//2,0))
+        # self.cv5 = Conv(c1, c_, (1, 7), (1, s),padding=(0, 7//2))
+        # self.cv6 = Conv(c_, c2, (7, 1), (s, 1), g=g,padding=(7//2,0))
+        self.cv1_1 = Conv(c1, c_, (1, k), (1, s), d=1)
+        self.cv1_2 = Conv(c_, c2, (k, 1), (s, 1), d=1)
+        self.cv2_1 = Conv(c1, c_, (1, k), (1, s), d=2)
+        self.cv2_2 = Conv(c_, c2, (k, 1), (s, 1), d=2)
+        self.cv5_1 = Conv(c1, c_, (1, k), (1, s), d=5)
+        self.cv5_2 = Conv(c_, c2, (k, 1), (s, 1), d=5)
+        self.squeeze = Conv(3 * c2, c2, 1)
+        self.add = shortcut and c1 == c2
+    def forward(self, x):
+        """Performs feature sampling, expanding, and applies shortcut if channels match; expects `x` input tensor."""
+        x1 = self.cv1_1(x)
+        x1 = self.cv1_2(x1)
+
+        x2 = self.cv2_1(x)
+        x2 = self.cv2_2(x2)
+
+        x5 = self.cv5_1(x)
+        x5 = self.cv5_2(x5)
+
+        output = torch.cat((x1, x2, x5), dim=1)
+        output = channel_shuffle(output, 4)
+        output = self.squeeze(output)
+
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        return x + output if self.add else output
+
+class RepCross(torch.nn.Module):
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False) -> None:
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv5 = Conv(c1, c_, (1, k), (1, s))
+        self.cv6 = Conv(c_, c2, (k, 1), (s, 1), g=g)
+        # self.conv = self.cv2(self.cv1)
+        # self.cv3 = Conv(c1, c_, (1, 5), (1, s),padding=(0, 5//2))
+        # self.cv4 = Conv(c_, c2, (5, 1), (s, 1), g=g,padding=(5//2,0))
+        self.cv1 = Conv(c1, c_, (1, 7), (1, s))
+        self.cv2 = Conv(c_, c2, (7, 1), (s, 1), g=g)
+        # self.conv1 = self.cv5(self.cv6)
+        self.add = shortcut and c1 == c2
+        # self.act = nn.SiLU()
+
+    def forward(self, x):
+        attn_0 = self.cv1(x)
+        attn_2 = self.cv5(x)
+        x0 = x + attn_0 + attn_2
+        attn_0 = self.cv2(x0)
+        attn_2 = self.cv6(x0)
+        # attn_1 = self.cv3(x)
+        # attn_1 = self.cv4(attn_1)
+        attn = x0 + attn_0 + attn_2
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        return x + attn if self.add else attn
+class CrossConvPro(nn.Module):
+    # Cross Convolution Downsample
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+        """
+        Initializes CrossConv with downsampling, expanding, and optionally shortcutting; `c1` input, `c2` output
+        channels.
+
+        Inputs are ch_in, ch_out, kernel, stride, groups, expansion, shortcut.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, (1, k), (1, s))
+        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
+        # self.cv3 = Conv(c1, c_, (1, 5), (1, s),padding=(0, 5//2))
+        # self.cv4 = Conv(c_, c2, (5, 1), (s, 1), g=g,padding=(5//2,0))
+        self.cv5 = Conv(c1, c_, (1, 7), (1, s))
+        self.cv6 = Conv(c_, c2, (7, 1), (s, 1), g=g)
+        self.add = shortcut and c1 == c2
+    def forward(self, x):
+        """Performs feature sampling, expanding, and applies shortcut if channels match; expects `x` input tensor."""
+        attn_0 = self.cv1(x)
+        attn_0 = self.cv2(attn_0)
+
+        # attn_1 = self.cv3(x)
+        # attn_1 = self.cv4(attn_1)
+
+        attn_2 = self.cv5(x)
+        attn_2 = self.cv6(attn_2)
+        attn = attn_0 + attn_2
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        return x + attn if self.add else attn
+
+class C2fMSC(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initializes a CSP bottleneck with 2 convolutions and n Bottleneck blocks for faster processing."""
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList((RepCross(self.c, self.c, 3, 1, g, 1, shortcut) for _ in range(n)))
+        # self.concat = BiFPN_WConcat(inc_list=[self.c] * (2 + n), dimension=1)
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        # y = list(channel_shuffle(self.cv1(x), 4).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+        # return self.cv2(self.concat(y))
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+        # return self.cv2(self.concat(y))
+
+# ################### MHA begin #############################
+# class MHA(nn.Module):
+#     def __init__(self, embed_dim, num_heads):
+#         super(MHA, self).__init__()
+#         self.num_heads = num_heads
+#         self.embed_dim = embed_dim
+#         self.head_dim = embed_dim // num_heads
+#         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+#
+#         # Khởi tạo các lớp tuyến tính cho Q, K, V
+#         self.q_linear = nn.Linear(embed_dim, embed_dim)
+#         self.k_linear = nn.Linear(embed_dim, embed_dim)
+#         self.v_linear = nn.Linear(embed_dim, embed_dim)
+#         self.fc_out = nn.Linear(embed_dim, embed_dim)
+#
+#     def forward(self, x):
+#         if x.dim() == 4:  # Đảm bảo rằng x có đúng số chiều
+#             t, batch_size, seq_length, embed_dim = x.size()
+#         else:
+#             raise ValueError(f"Expected input with 3 dimensions, but got {x.size()}")
+#
+#         # batch_size, seq_length, embed_dim = x.size()
+#
+#
+#         # Tạo Q, K, V từ x
+#         Q = self.q_linear(x)
+#         K = self.k_linear(x)
+#         V = self.v_linear(x)
+#
+#         # Chia thành các đầu attention
+#         Q = Q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+#         K = K.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+#         V = V.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+#
+#         # Tính attention scores bằng scaled dot-product
+#         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+#         attention = torch.softmax(scores, dim=-1)
+#
+#         # Tính giá trị attention
+#         out = torch.matmul(attention, V)
+#         out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, embed_dim)
+#         out = self.fc_out(out)
+#
+#         return out
+#
+# ################### MHA end #############################
+class Fusion(nn.Module):
+    def __init__(self, inc_list, fusion='bifpn') -> None:
+        super().__init__()
+
+        assert fusion in ['weight', 'adaptive', 'concat', 'bifpn']
+        self.fusion = fusion
+
+        if self.fusion == 'bifpn':
+            self.fusion_weight = nn.Parameter(torch.ones(len(inc_list), dtype=torch.float32), requires_grad=True)
+            self.relu = nn.ReLU()
+            self.epsilon = 1e-4
+        else:
+            self.fusion_conv = nn.ModuleList([Conv(inc, inc, 1) for inc in inc_list])
+
+            if self.fusion == 'adaptive':
+                self.fusion_adaptive = Conv(sum(inc_list), len(inc_list), 1)
+
+    def forward(self, x):
+        if self.fusion in ['weight', 'adaptive']:
+            for i in range(len(x)):
+                x[i] = self.fusion_conv[i](x[i])
+        if self.fusion == 'weight':
+            return torch.sum(torch.stack(x, dim=0), dim=0)
+        elif self.fusion == 'adaptive':
+            fusion = torch.softmax(self.fusion_adaptive(torch.cat(x, dim=1)), dim=1)
+            x_weight = torch.split(fusion, [1] * len(x), dim=1)
+            return torch.sum(torch.stack([x_weight[i] * x[i] for i in range(len(x))], dim=0), dim=0)
+        elif self.fusion == 'concat':
+            return torch.cat(x, dim=1)
+        elif self.fusion == 'bifpn':
+            fusion_weight = self.relu(self.fusion_weight.clone())
+            fusion_weight = fusion_weight / (torch.sum(fusion_weight, dim=0))
+            return torch.sum(torch.stack([fusion_weight[i] * x[i] for i in range(len(x))], dim=0), dim=0)
 
 
 class C3(nn.Module):
@@ -258,7 +665,6 @@ class C3(nn.Module):
         """Forward pass through the CSP bottleneck with 2 convolutions."""
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
-
 class C3x(C3):
     """C3 module with cross-convolutions."""
 
@@ -266,7 +672,8 @@ class C3x(C3):
         """Initialize C3TR instance and set default parameters."""
         super().__init__(c1, c2, n, shortcut, g, e)
         self.c_ = int(c2 * e)
-        self.m = nn.Sequential(*(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n)))
+        # self.m = nn.Sequential(*(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n)))
+        self.m = nn.Sequential(*(CrossConvPro(self.c_, self.c_, 3, 1, g, 1, shortcut) for _ in range(n)))
 
 
 class RepC3(nn.Module):
@@ -294,6 +701,7 @@ class C3TR(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = TransformerBlock(c_, c_, 4, n)
+        # self.m = DeformableTransformerDecoderLayer(c_, 8)
 
 
 class C3Ghost(C3):
@@ -441,15 +849,15 @@ class MaxSigmoidAttnBlock(nn.Module):
 
 class C2fAttn(nn.Module):
     """C2f module with an additional attn module."""
-
     def __init__(self, c1, c2, n=1, ec=128, nh=1, gc=512, shortcut=False, g=1, e=0.5):
         """Initializes C2f module with attention mechanism for enhanced feature extraction and processing."""
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((3 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.m = nn.ModuleList(RepCross(self.c, self.c, 3, 1, g, 1, shortcut) for _ in range(n))
         self.attn = MaxSigmoidAttnBlock(self.c, self.c, gc=gc, ec=ec, nh=nh)
+        # self.attn = MHA(self.c, 3)
 
     def forward(self, x, guide):
         """Forward pass through C2f layer."""
@@ -464,7 +872,29 @@ class C2fAttn(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         y.append(self.attn(y[-1], guide))
         return self.cv2(torch.cat(y, 1))
+class C2fCBam(nn.Module):
+    """C2f module with an additional attn module."""
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initializes C2f module with attention mechanism for enhanced feature extraction and processing."""
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((3 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        # self.m = nn.ModuleList(RepCross(self.c, self.c, 3, 1, g, 1, shortcut) for _ in range(n))
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.attn = CBAM(self.cv2,  7)
 
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.attn(self.cv2(torch.cat(y, 1)))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.attn(self.cv2(torch.cat(y, 1)))
 
 class ImagePoolingAttn(nn.Module):
     """ImagePoolingAttn: Enhance the text embeddings with image-aware information."""
@@ -612,7 +1042,6 @@ class ELAN1(RepNCSPELAN4):
         self.cv3 = Conv(c4, c4, 3, 1)
         self.cv4 = Conv(c3 + (2 * c4), c2, 1, 1)
 
-
 class AConv(nn.Module):
     """AConv."""
 
@@ -626,27 +1055,82 @@ class AConv(nn.Module):
         x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
         return self.cv1(x)
 
+#
+# class ADown(nn.Module):
+#     """ADown."""
+#
+#     def __init__(self, c1, c2):
+#         """Initializes ADown module with convolution layers to downsample input from channels c1 to c2."""
+#         super().__init__()
+#         self.c = c2 // 2
+#         self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
+#         self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
+#
+#     def forward(self, x):
+#         """Forward pass through ADown layer."""
+#         x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+#         x1, x2 = x.chunk(2, 1)
+#         x1 = self.cv1(x1)
+#         x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+#         x2 = self.cv2(x2)
+#         return torch.cat((x1, x2), 1)
+
+
+# class AConv(nn.Module):
+#     """ADown."""
+#
+#     def __init__(self, c1, c2):
+#         """Initializes ADown module with convolution layers to downsample input from channels c1 to c2."""
+#         super().__init__()
+#         self.c = c2 // 2
+#         self.cv1 = Conv(c1, c1, 3, 2, 1)
+#         self.cvdw = Conv(c1, c2, 7, 2, 3, g=c1)
+#         # self.cv1 = LDConv(c1 // 2, self.c, 5, 2, 1)
+#         self.cv2 = Conv(c2, 2 * c1, 1, 1, 0)
+#         self.cv3 = Conv(2 * c1, c2, 1, 1, 0)
+#         self.cv4 = Conv(c1, c1, 1, 1, 0)
+#
+#     def forward(self, x):
+#         """Forward pass through ADown layer."""
+#         # x1 = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+#         # x = torch.nn.functional.max_pool2d(x, 3, 2, 1)
+#         # x1, x2 = x.chunk(2, 1)
+#         x1 = self.cv1(x)
+#         x2 = torch.nn.functional.max_pool2d(x, 3, 2, 1)
+#         # x2 = self.cv4(x2)
+#         x3 = self.cv2(self.cvdw(x))
+#         # x3 = self.cvdw(self.cv2(x))
+#         x0 = torch.cat((x1, x2), 1)
+#         return self.cv3(x0 + x3)
 
 class ADown(nn.Module):
     """ADown."""
-
     def __init__(self, c1, c2):
         """Initializes ADown module with convolution layers to downsample input from channels c1 to c2."""
         super().__init__()
         self.c = c2 // 2
-        self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
-        self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
+        self.cv1 = Conv(c1, c1, 3, 2, 1)
+        # self.cbam = CBAM(c1)
+        self.cvdw = Conv(c1, c2, 7, 2, 3, g=c1)
+        # self.cvdw = RepVGGDW(c1,c2)
+        # self.cv1 = LDConv(c1 // 2, self.c, 5, 2, 1)
+        self.cv2 = Conv(c2, c1, 1, 1, 0)
+        self.cv3 = Conv(c1, c2, 1, 1, 0)
+        # self.cv4 = Conv(c1, c1, 1, 1, 0)
 
     def forward(self, x):
         """Forward pass through ADown layer."""
-        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
-        x1, x2 = x.chunk(2, 1)
-        x1 = self.cv1(x1)
-        x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
-        x2 = self.cv2(x2)
-        return torch.cat((x1, x2), 1)
-
-
+        # x1 = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+        # x = torch.nn.functional.max_pool2d(x, 3, 2, 1)
+        # x1, x2 = x.chunk(2, 1)
+        # x = self.cbam(x)
+        x1 = self.cv1(x)
+        x2 = torch.nn.functional.max_pool2d(x, 3, 2, 1)
+        # x2 = self.cv4(x2)
+        x3 = self.cv2(self.cvdw(x)) #best
+        # x3 = self.cvdw(x) #repvggdw
+        # x0= torch.cat((x1, x2), 1)
+        return self.cv3(x1+x2+x3)
 class SPPELAN(nn.Module):
     """SPP-ELAN."""
 
@@ -699,11 +1183,13 @@ class CBFuse(nn.Module):
 class RepVGGDW(torch.nn.Module):
     """RepVGGDW is a class that represents a depth wise separable convolutional block in RepVGG architecture."""
 
-    def __init__(self, ed) -> None:
+    def __init__(self, ed, od=None) -> None:
         """Initializes RepVGGDW with depthwise separable convolutional layers for efficient processing."""
         super().__init__()
         self.conv = Conv(ed, ed, 7, 1, 3, g=ed, act=False)
         self.conv1 = Conv(ed, ed, 3, 1, 1, g=ed, act=False)
+        # self.conv = Conv(ed, od, 7, 2, 3, g=ed, act=False)
+        # self.conv1 = Conv(ed, od, 3, 2, 1, g=ed, act=False)
         self.dim = ed
         self.act = nn.SiLU()
 
@@ -758,26 +1244,76 @@ class RepVGGDW(torch.nn.Module):
         del self.conv1
 
 
+# class CIB(nn.Module):
+#     """
+#     Conditional Identity Block (CIB) module.
+#
+#     Args:
+#         c1 (int): Number of input channels.
+#         c2 (int): Number of output channels.
+#         shortcut (bool, optional): Whether to add a shortcut connection. Defaults to True.
+#         e (float, optional): Scaling factor for the hidden channels. Defaults to 0.5.
+#         lk (bool, optional): Whether to use RepVGGDW for the third convolutional layer. Defaults to False.
+#     """
+#
+#     def __init__(self, c1, c2, shortcut=True, e=0.5, lk=False):
+#         """Initializes the custom model with optional shortcut, scaling factor, and RepVGGDW layer."""
+#         super().__init__()
+#         c_ = int(c2 * e)  # hidden channels
+#         self.cv1 = nn.Sequential(
+#             Conv(c1, c1, 3, g=c1),
+#             Conv(c1, 2 * c_, 1),
+#             RepVGGDW(2 * c_) if lk else Conv(2 * c_, 2 * c_, 3, g=2 * c_),
+#             Conv(2 * c_, c2, 1),
+#             Conv(c2, c2, 3, g=c2),
+#         )
+#
+#         self.add = shortcut and c1 == c2
+#
+#     def forward(self, x):
+#         """
+#         Forward pass of the CIB module.
+#
+#         Args:
+#             x (torch.Tensor): Input tensor.
+#
+#         Returns:
+#             (torch.Tensor): Output tensor.
+#         """
+#         return x + self.cv1(x) if self.add else self.cv1(x)
+#
+#
+# class C2fCIB(C2f):
+#     """
+#     C2fCIB class represents a convolutional block with C2f and CIB modules.
+#
+#     Args:
+#         c1 (int): Number of input channels.
+#         c2 (int): Number of output channels.
+#         n (int, optional): Number of CIB modules to stack. Defaults to 1.
+#         shortcut (bool, optional): Whether to use shortcut connection. Defaults to False.
+#         lk (bool, optional): Whether to use local key connection. Defaults to False.
+#         g (int, optional): Number of groups for grouped convolution. Defaults to 1.
+#         e (float, optional): Expansion ratio for CIB modules. Defaults to 0.5.
+#     """
+#
+#     def __init__(self, c1, c2, n=1, shortcut=False, lk=False, g=1, e=0.5):
+#         """Initializes the module with specified parameters for channel, shortcut, local key, groups, and expansion."""
+#         super().__init__(c1, c2, n, shortcut, g, e)
+#         self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 class CIB(nn.Module):
-    """
-    Conditional Identity Block (CIB) module.
-
-    Args:
-        c1 (int): Number of input channels.
-        c2 (int): Number of output channels.
-        shortcut (bool, optional): Whether to add a shortcut connection. Defaults to True.
-        e (float, optional): Scaling factor for the hidden channels. Defaults to 0.5.
-        lk (bool, optional): Whether to use RepVGGDW for the third convolutional layer. Defaults to False.
-    """
+    """Standard bottleneck."""
 
     def __init__(self, c1, c2, shortcut=True, e=0.5, lk=False):
-        """Initializes the custom model with optional shortcut, scaling factor, and RepVGGDW layer."""
+        """Initializes a bottleneck module with given input/output channels, shortcut option, group, kernels, and
+        expansion.
+        """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = nn.Sequential(
             Conv(c1, c1, 3, g=c1),
             Conv(c1, 2 * c_, 1),
-            RepVGGDW(2 * c_) if lk else Conv(2 * c_, 2 * c_, 3, g=2 * c_),
+            Conv(2 * c_, 2 * c_, 3, g=2 * c_) if not lk else RepVGGDW(2 * c_),
             Conv(2 * c_, c2, 1),
             Conv(c2, c2, 3, g=c2),
         )
@@ -785,37 +1321,18 @@ class CIB(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """
-        Forward pass of the CIB module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            (torch.Tensor): Output tensor.
-        """
+        """'forward()' applies the YOLO FPN to input data."""
         return x + self.cv1(x) if self.add else self.cv1(x)
 
-
 class C2fCIB(C2f):
-    """
-    C2fCIB class represents a convolutional block with C2f and CIB modules.
-
-    Args:
-        c1 (int): Number of input channels.
-        c2 (int): Number of output channels.
-        n (int, optional): Number of CIB modules to stack. Defaults to 1.
-        shortcut (bool, optional): Whether to use shortcut connection. Defaults to False.
-        lk (bool, optional): Whether to use local key connection. Defaults to False.
-        g (int, optional): Number of groups for grouped convolution. Defaults to 1.
-        e (float, optional): Expansion ratio for CIB modules. Defaults to 0.5.
-    """
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, lk=False, g=1, e=0.5):
-        """Initializes the module with specified parameters for channel, shortcut, local key, groups, and expansion."""
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
-
 
 class Attention(nn.Module):
     """
@@ -916,32 +1433,96 @@ class PSA(nn.Module):
         b = b + self.ffn(b)
         return self.cv2(torch.cat((a, b), 1))
 
-
 class SCDown(nn.Module):
-    """Spatial Channel Downsample (SCDown) module for reducing spatial and channel dimensions."""
-
     def __init__(self, c1, c2, k, s):
-        """
-        Spatial Channel Downsample (SCDown) module.
-
-        Args:
-            c1 (int): Number of input channels.
-            c2 (int): Number of output channels.
-            k (int): Kernel size for the convolutional layer.
-            s (int): Stride for the convolutional layer.
-        """
         super().__init__()
         self.cv1 = Conv(c1, c2, 1, 1)
         self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
 
     def forward(self, x):
-        """
-        Forward pass of the SCDown module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            (torch.Tensor): Output tensor after applying the SCDown module.
-        """
         return self.cv2(self.cv1(x))
+# class SCDown(nn.Module):
+#     """Spatial Channel Downsample (SCDown) module for reducing spatial and channel dimensions."""
+#
+#     def __init__(self, c1, c2, k, s):
+#         """
+#         Spatial Channel Downsample (SCDown) module.
+#
+#         Args:
+#             c1 (int): Number of input channels.
+#             c2 (int): Number of output channels.
+#             k (int): Kernel size for the convolutional layer.
+#             s (int): Stride for the convolutional layer.
+#         """
+#         super().__init__()
+#         self.cv1 = Conv(c1, c2, 1, 1)
+#         self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
+#
+#     def forward(self, x):
+#         """
+#         Forward pass of the SCDown module.
+#
+#         Args:
+#             x (torch.Tensor): Input tensor.
+#
+#         Returns:
+#             (torch.Tensor): Output tensor after applying the SCDown module.
+#         """
+#         return self.cv2(self.cv1(x))
+def channel_shuffle(x, groups=2):  ##shuffle channel
+    # RESHAPE----->transpose------->Flatten
+    B, C, H, W = x.size()
+    out = x.view(B, groups, C // groups, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    out = out.view(B, C, H, W)
+    return out
+
+
+
+class IncepCrossConvPro(nn.Module):
+    # Cross Convolution Downsample
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+        """
+        Initializes CrossConv with downsampling, expanding, and optionally shortcutting; `c1` input, `c2` output
+        channels.
+
+        Inputs are ch_in, ch_out, kernel, stride, groups, expansion, shortcut.
+        """
+        super().__init__()
+        c_ = int(c2 * 0.5)  # hidden channels
+        self.cv0 = Conv(c1, c_, 1, 1)
+        self.cv1 = Conv(c_, c_, (1, k), (1, s),p=(0, k//2))
+        self.cv2 = Conv(c_, c_, (k, 1), (s, 1), g=g,p=(k//2,0))
+        # self.cv1 = Conv(c_, c_, (1, 5), (1, s),padding=(0, 5//2))
+        # self.cv2 = Conv(c_, c_, (5, 1), (s, 1), g=g,padding=(5//2,0))
+        self.cv5 = Conv(c_, c_, (1, 7), (1, s),p=(0, 7//2))
+        self.cv6 = Conv(c_, c_, (7, 1), (s, 1), g=g,p=(7//2,0))
+        self.ch_cv = Conv(c1, c2, 1, 1)
+        # self.ca = CoordAtt(c1, c1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        """Performs feature sampling, expanding, and applies shortcut if channels match; expects `x` input tensor."""
+        x1 = self.cv0(x)
+        attn_0 = self.cv1(x1)
+        attn_0 = self.cv2(attn_0)
+
+        # attn_1 = self.cv3(x)
+        # attn_1 = self.cv4(attn_1)
+        x2 = self.cv0(x)
+        attn_2 = self.cv5(x2)
+        attn_2 = self.cv6(attn_2)
+        x3 = torch.cat((attn_0, attn_2), 1)
+        x3 = channel_shuffle(x3, 4)
+        # x3 = self.ch_cv(x3)
+        # x3 = self.ca(channel_shuffle(x3, 4))
+        return x + x3 if self.add else x3
+
+class C3IMSC(C3):
+    # C3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """Initializes C3x module with cross-convolutions, extending C3 with customizable channel dimensions, groups,
+        and expansion.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(IncepCrossConvPro(c_, c_, 3, 1, g, 0.5, shortcut) for _ in range(n)))

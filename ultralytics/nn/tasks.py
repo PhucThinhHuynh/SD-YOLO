@@ -18,6 +18,10 @@ from ultralytics.nn.modules import (
     ELAN1,
     OBB,
     PSA,
+    CBAM,
+    SEAttention,
+    CoordAtt,
+    ECAAttention,
     SPP,
     SPPELAN,
     SPPF,
@@ -26,23 +30,34 @@ from ultralytics.nn.modules import (
     Bottleneck,
     BottleneckCSP,
     C2f,
+    C2fPara,
     C2fAttn,
+    C2fCBam,
     C2fCIB,
+    C2fMSC,
     C3Ghost,
     C3x,
     CBFuse,
     CBLinear,
     Classify,
     Concat,
+    BiFPN_Concat3,
+    BiFPN_Concat2,
+    BiFPN_WConcat3,
+    BiFPN_WConcat2,
     Conv,
     Conv2,
+    Faster_Block,
     ConvTranspose,
     Detect,
+    Fusion,
     DWConv,
+    DDWConv,
     DWConvTranspose2d,
     Focus,
     GhostBottleneck,
     GhostConv,
+    LDConv,
     HGBlock,
     HGStem,
     ImagePoolingAttn,
@@ -51,12 +66,14 @@ from ultralytics.nn.modules import (
     RepConv,
     RepNCSPELAN4,
     RepVGGDW,
+    RepCross,
     ResNetLayer,
     RTDETRDecoder,
     SCDown,
     Segment,
     WorldDetect,
     v10Detect,
+    # Detect_dyhead,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -79,6 +96,7 @@ from ultralytics.utils.torch_utils import (
     scale_img,
     time_sync,
 )
+
 
 try:
     import thop
@@ -197,7 +215,7 @@ class BaseModel(nn.Module):
         """
         if not self.is_fused():
             for m in self.model.modules():
-                if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
+                if isinstance(m, (Conv, Conv2, DWConv, DDWConv, Faster_Block)) and hasattr(m, "bn"):
                     if isinstance(m, Conv2):
                         m.fuse_convs()
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
@@ -964,16 +982,21 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             Conv,
             ConvTranspose,
             GhostConv,
+            LDConv,
             Bottleneck,
             GhostBottleneck,
             SPP,
             SPPF,
             DWConv,
+            DDWConv,
+            Faster_Block,
             Focus,
             BottleneckCSP,
             C1,
             C2,
             C2f,
+            C2fPara,
+            C2fCBam,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -988,8 +1011,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C3x,
             RepC3,
             PSA,
+            CBAM,
+            SEAttention,
+            CoordAtt,
+            ECAAttention,
             SCDown,
             C2fCIB,
+            C2fMSC,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1001,7 +1029,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 )  # num heads
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C1, C2, C2f, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3, C2fCIB}:
+            if m in {BottleneckCSP, C1, C2, C2f, C2fPara,C2fCBam, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3, C2fCIB, C2fMSC}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is AIFI:
@@ -1018,12 +1046,24 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is BiFPN_Concat3:
+            c2 = sum(ch[x] for x in f)
+        elif m is BiFPN_Concat2:
+            c2 = sum(ch[x] for x in f)
+        elif m is BiFPN_WConcat3:
+            c2 = sum(ch[x] for x in f)
+        elif m is BiFPN_WConcat2:
+            c2 = sum(ch[x] for x in f)
         elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m is Fusion:
+            args[0] = 'bifpn'
+            c1, c2 = [ch[x] for x in f], (sum([ch[x] for x in f]) if args[0] == 'concat' else ch[f[0]])
+            args = [c1, args[0]]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]

@@ -125,6 +125,7 @@ class TransformerLayer(nn.Module):
         self.k = nn.Linear(c, c, bias=False)
         self.v = nn.Linear(c, c, bias=False)
         self.ma = nn.MultiheadAttention(embed_dim=c, num_heads=num_heads)
+        # self.ma = MSDeformAttn(c, n_heads=num_heads)
         self.fc1 = nn.Linear(c, c, bias=False)
         self.fc2 = nn.Linear(c, c, bias=False)
 
@@ -153,9 +154,8 @@ class TransformerBlock(nn.Module):
             x = self.conv(x)
         b, _, w, h = x.shape
         p = x.flatten(2).permute(2, 0, 1)
+        # return x + self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
         return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
-
-
 class MLPBlock(nn.Module):
     """Implements a single block of a multi-layer perceptron."""
 
