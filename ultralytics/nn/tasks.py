@@ -205,9 +205,6 @@ class BaseModel(nn.Module):
                     m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
-                if isinstance(m):
-                    m.fuse_convs()
-                    m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
