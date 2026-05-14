@@ -12,8 +12,6 @@ SD-YOLO employs a holistic architectural redesign strategy that combines special
 
 Comprehensive evaluations demonstrate SD-YOLO's superior performance, with SD-YOLOn achieving 35.8% mAP₀.₅ on VisDrone-2019 while reducing parameters by 65% compared to YOLOv8n, and SD-YOLOs reaching state-of-the-art 79.2% mAP₀.₅ on LEVIR-Ship, establishing new benchmarks for lightweight yet accurate object detection in resource-constrained UAV applications.
 
-The Python code and dataset provided here are included in the under-review paper at Springer Signal Image Video Process.
-
 Phuc-Thinh Huynh, Minh-Thanh Le, Tran Duc Tan, Thien Huynh-The, "SD-YOLO: A Lightweight and High-Performance Deep Model for Small and Dense Object Detection", (2025), Signal Image Video Process.
 
 If there are any errors or topics that need to be discussed, please contact [Phuc-Thinh Huynh]([https://github.com/PhucThinhHuynh]) via email at huynhphucthinh51@gmail.com.
